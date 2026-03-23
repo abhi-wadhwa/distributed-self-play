@@ -1,0 +1,143 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{hyperref}
+\usepackage{natbib}
+
+\newtheorem{definition}{Definition}
+
+\title{Distributed Self-Play Training:\\Scaling AlphaZero with Prioritized Replay and ELO Tracking}
+\author{Abhi Wadhwa}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+These are my notes on building a distributed self-play training system in the style of AlphaZero. I cover the actor-learner architecture and why it's necessary at scale, prioritized experience replay and the importance-sampling corrections that keep it unbiased, the dual-headed ResNet loss, data augmentation via game symmetries, ELO-based model versioning, and the systems challenge of keeping actors in sync without blocking. The math is mostly standard but the systems design choices have subtle implications for training dynamics.
+\end{abstract}
+
+\section{Why Distributed?}
+
+AlphaZero-style training has a bottleneck: generating self-play games is expensive because each move requires hundreds of MCTS simulations, each of which calls the neural network. A single machine can only play so many games per second. But the learner can consume training data much faster than a single actor can produce it. The natural solution is to \textbf{decouple game generation from training} by running them as separate processes.
+
+The actor-learner architecture does exactly this: $N$ actors generate games in parallel, push experience to a shared buffer, and a single learner trains on that buffer. The throughput scales linearly with the number of actors (up to the point where the buffer or the learner becomes the bottleneck).
+
+\section{The Dual-Headed ResNet}
+
+The neural network follows AlphaZero's architecture: a shared ResNet backbone feeding into two separate heads.
+
+\subsection{Architecture}
+
+The input is a tensor encoding the board state (typically a stack of binary feature planes). This passes through:
+\begin{enumerate}
+\item An initial convolutional layer
+\item A tower of $L$ residual blocks, each consisting of two conv layers with batch normalization and ReLU activations, plus a skip connection
+\item Two output heads branching from the final residual block
+\end{enumerate}
+
+The \textbf{policy head} outputs a probability distribution over actions. It uses a $1 \times 1$ convolution to reduce channels, followed by a fully connected layer and softmax:
+\[
+\mathbf{p} = \text{softmax}(W_p \cdot \text{conv}_{1 \times 1}(\mathbf{h}) + b_p)
+\]
+
+The \textbf{value head} outputs a scalar position evaluation in $[-1, 1]$. It uses a $1 \times 1$ convolution, a fully connected layer with ReLU, a second FC layer, and tanh:
+\[
+v = \tanh(W_{v2} \cdot \text{ReLU}(W_{v1} \cdot \text{conv}_{1 \times 1}(\mathbf{h}) + b_{v1}) + b_{v2})
+\]
+
+\subsection{Loss Function}
+
+Training minimizes a combined loss:
+\begin{equation}\label{eq:loss}
+\mathcal{L} = \underbrace{(z - v)^2}_{L_v} + \underbrace{(-\boldsymbol{\pi}^\top \log \mathbf{p})}_{L_p} + c \|\theta\|^2
+\end{equation}
+where $z \in \{-1, +1\}$ is the game outcome from the current player's perspective, $v$ is the network's value prediction, $\boldsymbol{\pi}$ is the MCTS policy target (visit counts normalized to probabilities), and $\mathbf{p}$ is the network's policy output.
+
+The value loss $L_v$ is just MSE between predicted and actual game outcome. The policy loss $L_p$ is cross-entropy between the MCTS search policy and the network's policy. \textbf{The key insight is that the MCTS policy is a better training signal than the raw game outcome for the policy head}, because it captures not just what the best move is but the relative quality of all moves (as reflected by how often MCTS visited them).
+
+\section{Prioritized Experience Replay}
+
+Not all training samples are equally useful. Positions where the network's value prediction was far off (high TD error) are more informative than positions where it was already accurate. Prioritized experience replay \citep{schaul2016per} formalizes this.
+
+\subsection{Priority Sampling}
+
+Each experience $i$ in the buffer has a priority $p_i = |\delta_i| + \epsilon$, where $\delta_i$ is the TD error and $\epsilon > 0$ is a small constant to prevent zero priorities. The sampling probability is
+\begin{equation}
+P(i) = \frac{p_i^\alpha}{\sum_j p_j^\alpha}
+\end{equation}
+The exponent $\alpha \in [0,1]$ controls how aggressively we prioritize. With $\alpha = 0$, it's uniform sampling. With $\alpha = 1$, sampling is fully proportional to priority. I typically use $\alpha = 0.6$.
+
+\subsection{Importance Sampling Correction}
+
+Here's a subtlety I initially missed. Prioritized sampling introduces bias because we're no longer sampling uniformly from the replay buffer. The gradient estimate becomes biased toward high-priority samples. To correct this, we apply importance sampling weights:
+\begin{equation}
+w_i = \left(\frac{1}{N \cdot P(i)}\right)^\beta
+\end{equation}
+where $N$ is the buffer size and $\beta \in [0,1]$ controls how much correction to apply. The weights are normalized: $\hat{w}_i = w_i / \max_j w_j$.
+
+\textbf{The trick is to anneal $\beta$ from some initial value toward 1 over the course of training.} Early on ($\beta$ small), we want the biased sampling to focus learning on hard cases. As training progresses and we approach convergence, we increase $\beta$ toward 1 so the gradient estimates become unbiased, which matters for convergence guarantees.
+
+In practice, each training step computes the loss with importance weights:
+\[
+\mathcal{L}_{\text{weighted}} = \sum_i \hat{w}_i \cdot \mathcal{L}_i
+\]
+and after the update, the priorities $p_i$ are refreshed with the new TD errors.
+
+\section{Data Augmentation via Symmetries}
+
+Board games typically have symmetries---rotations, reflections, or both---that preserve the game state. For Connect Four, there's a single mirror symmetry (flip left-right). For Othello, there are 8 symmetries (the dihedral group $D_4$: 4 rotations $\times$ 2 reflections).
+
+Given a training example $(\text{board}, \boldsymbol{\pi}, z)$, we generate $|G|$ augmented examples by applying each symmetry $g \in G$:
+\[
+(\text{board}, \boldsymbol{\pi}, z) \xrightarrow{g} (g \cdot \text{board}, g \cdot \boldsymbol{\pi}, z)
+\]
+Note that the policy must be transformed consistently with the board---if you rotate the board 90 degrees, you need to rotate the action probabilities by 90 degrees too. The value $z$ is invariant since it only depends on who wins.
+
+This is essentially free data. For Othello with 8-fold symmetry, you multiply your dataset by 8 with no additional game-playing cost. After playing with this for a while, I found that the augmentation matters more early in training when data is scarce, and becomes less important as the buffer fills up.
+
+\section{ELO Tracking for Model Versioning}
+
+As training progresses, the network improves. But how much? And is the improvement monotonic? I maintain a league of past model checkpoints and evaluate new models against the league using ELO ratings.
+
+The ELO system is the same as described in the arena project: expected scores via the logistic function $E_A = 1/(1 + 10^{(R_B - R_A)/400})$, updates $R_A' = R_A + K(S_A - E_A)$. New checkpoints start with the previous model's rating and play a set of evaluation games against recent past versions and the random baseline.
+
+This gives you a smooth curve of playing strength over training time, which is much more informative than looking at loss curves. \textbf{You can have decreasing loss but stagnant ELO} (the model fits the training data better but doesn't actually play better), and ELO tracking catches this.
+
+\section{The Synchronization Challenge}
+
+This is where the systems design gets interesting. Actors need to use reasonably fresh model weights, but you can't pause them every time the learner does a gradient step. The approach I use:
+
+\begin{enumerate}
+\item The learner publishes weights to Redis after every $k$ gradient steps (I use $k=100$).
+\item Each actor polls for new weights between games (not between moves, which would be too disruptive).
+\item If new weights are available, the actor loads them and continues; otherwise it keeps using the old ones.
+\end{enumerate}
+
+This means actors are always slightly behind the learner---they're generating data with a stale policy. \textbf{This is actually fine.} The replay buffer already mixes data from different policy versions (off-policy data), and the prioritized sampling naturally upweights experiences that are surprising to the current network, which includes experiences generated by outdated policies that discovered states the current network handles poorly.
+
+The real failure mode is if actors get \textit{too} stale---like hundreds of gradient steps behind. Then the experience they generate is so off-policy that it's essentially noise. In practice, with reasonable publishing frequency and actor counts, this isn't an issue.
+
+\begin{thebibliography}{9}
+\bibitem[Schaul et~al., 2016]{schaul2016per}
+Schaul, T., Quan, J., Antonoglou, I., and Silver, D. (2016).
+Prioritized experience replay.
+\textit{International Conference on Learning Representations (ICLR)}.
+
+\bibitem[Silver et~al., 2017]{silver2017alphazero}
+Silver, D., Schrittwieser, J., Simonyan, K., Antonoglou, I., Huang, A., Guez, A., Hubert, T., Baker, L., Lai, M., Bolton, A., et~al. (2017).
+Mastering the game of Go without human knowledge.
+\textit{Nature}, 550(7676):354--359.
+
+\bibitem[Silver et~al., 2018]{silver2018general}
+Silver, D., Hubert, T., Schrittwieser, J., Antonoglou, I., Lai, M., Guez, A., Lanctot, M., Sifre, L., Kumaran, D., Graepel, T., et~al. (2018).
+A general reinforcement learning algorithm that masters chess, shogi, and Go through self-play.
+\textit{Science}, 362(6419):1140--1144.
+
+\bibitem[He et~al., 2016]{he2016resnet}
+He, K., Zhang, X., Ren, S., and Sun, J. (2016).
+Deep residual learning for image recognition.
+\textit{IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}.
+\end{thebibliography}
+
+\end{document}
