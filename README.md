@@ -1,15 +1,23 @@
 # distributed-self-play
 
-Scalable AlphaZero-style self-play training with actor-learner architecture, prioritized replay, and ELO-based model versioning.
+scalable self-play training across multiple machines. the infrastructure behind training game-playing agents at scale.
 
-## Quickstart
+## what this is
+
+- **actor-learner architecture** — actors generate games in parallel, learner trains the neural network on the stream of data
+- **redis communication** — actors push experience to a shared replay buffer via redis. learner pulls batches asynchronously
+- **model versioning** — actors periodically pull the latest model weights. play against recent versions of yourself, not just the current one (avoids forgetting)
+- **ELO tracking** — monitor training progress via estimated ELO ratings against a fixed set of benchmark agents
+
+## running it
 
 ```bash
-git clone https://github.com/abhi-wadhwa/distributed-self-play.git
-cd distributed-self-play
-make install
-make run
-make test
+pip install -r requirements.txt
+redis-server &
+python learner.py &
+python actor.py --num-workers 8
 ```
 
-See `docs/` for the math.
+## why distribute
+
+self-play is embarrassingly parallel on the data generation side: each game is independent. the bottleneck is the learner's GPU. by running many actors on CPUs (or cheap machines) feeding a single GPU learner, you can generate training data 10-100x faster than single-machine training. this is basically the alphazero infrastructure pattern, simplified.
