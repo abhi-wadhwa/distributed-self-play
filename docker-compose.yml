@@ -1,0 +1,102 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  learner:
+    build: .
+    command: >
+      python -m src.cli learner
+        --game connect4
+        --redis-host redis
+        --redis-port 6379
+        --device auto
+        --batch-size 256
+        --lr 1e-3
+        --buffer-capacity 500000
+        --min-buffer 500
+        --checkpoint-dir /app/checkpoints
+        --channels 128
+        --res-blocks 8
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - checkpoints:/app/checkpoints
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+
+  actor:
+    build: .
+    command: >
+      python -m src.cli actor
+        --game connect4
+        --redis-host redis
+        --redis-port 6379
+        --simulations 100
+        --device cpu
+        --channels 128
+        --res-blocks 8
+    depends_on:
+      redis:
+        condition: service_healthy
+      learner:
+        condition: service_started
+    deploy:
+      replicas: 4
+
+  evaluator:
+    build: .
+    command: >
+      python -m src.cli evaluator
+        --game connect4
+        --redis-host redis
+        --redis-port 6379
+        --device cpu
+        --num-games 20
+        --simulations 50
+        --checkpoint-dir /app/checkpoints
+        --channels 128
+        --res-blocks 8
+    depends_on:
+      redis:
+        condition: service_healthy
+      learner:
+        condition: service_started
+    volumes:
+      - checkpoints:/app/checkpoints
+
+  dashboard:
+    build: .
+    command: >
+      python -m src.cli dashboard
+        --host 0.0.0.0
+        --port 5000
+        --redis-host redis
+        --redis-port 6379
+    ports:
+      - "5000:5000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:
+  checkpoints:
